@@ -1,0 +1,463 @@
+---
+title: "Value Validation Project: Population Health Analytics"
+author: "Walker Blackston, MSPH"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(sqldf)
+library(corrplot)
+library(gtsummary)
+library(gt)
+library(caret)
+library(pROC)
+library(broom)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Executive Summary
+
+> To demonstrate my fit for this team at Ochsner, rather than a traditional cover letter, I am submitting a simulated case study of my abilities. This project simulates a value-based population health strategy leveraging predictive modeling to segment high-risk patients. By integrating clinical and utilization data, we estimate that targeted care management for the top decile could yield a 6.7% ROI within 12 months. This framework is to demonstrate my workflow and approaches to opportunities I might face on this team, rather than specific findings.
+
+# Objectives
+
+Reduce avoidable utilization, target care management, quantify ROI, provide a pilot to transfer to real world data.
+
+# Data & Methods
+
+-   Simulated dataset - we simulated a variety of patient characteristics and claims data in a sample of patients at Ochsner hospitals in the greater New Orleans metro area (n=5,000)
+-   A full script of all data generation, output and analysis can be found in an attached Appendix if requested
+
+```{r simulate-data, echo=FALSE, message=FALSE, warning=FALSE}
+
+set.seed(123)
+
+n <- 5000
+
+patient_data <- data.frame(
+  patient_id = sprintf("P%04d", 1:n),
+  age = round(runif(n, 18, 90)),
+  sex = sample(c("Male", "Female"), n, replace = TRUE),
+  zip_income = round(rnorm(n, mean = 55000, sd = 16000)),
+  hypertension = rbinom(n, 1, 0.4),
+  diabetes = rbinom(n, 1, 0.25),
+  copd = rbinom(n, 1, 0.15),
+  depression = rbinom(n, 1, 0.2),
+  cancer = rbinom(n, 1, 0.05),
+  ed_visits = rpois(n, lambda = 1.5),
+  inpatient_admits = rpois(n, lambda = 0.5),
+  primary_care_visits = rpois(n, lambda = 3),
+  med_adherence_score = pmin(pmax(rnorm(n, mean = 0.75, sd = 0.15), 0), 1)
+)
+
+# Simulated total cost influenced by conditions and utilization
+patient_data$total_cost <- round(
+  750 +
+    500 * patient_data$hypertension +
+    700 * patient_data$diabetes +
+    900 * patient_data$copd +
+    600 * patient_data$depression +
+    1500 * patient_data$cancer +
+    300 * patient_data$ed_visits +
+    1500 * patient_data$inpatient_admits +
+    rnorm(n, mean = 1000, sd = 800)
+)
+
+risk_score <- with(patient_data,
+                   0.02 * age +
+                   0.5 * hypertension +
+                   0.7 * diabetes +
+                   0.8 * copd +
+                   0.6 * depression +
+                   1.2 * cancer +
+                   0.4 * ed_visits +
+                   1.0 * inpatient_admits +
+                   rnorm(n, 0, 1.5))  # Add noise
+
+# Convert to probability with logistic function
+risk_prob <- 1 / (1 + exp(-risk_score))
+
+# Assign high_risk based on probabilistic threshold
+patient_data$high_risk <- rbinom(n, 1, prob = risk_prob)
+
+# Preview
+head(patient_data)
+```
+
+------------------------------------------------------------------------
+
+### Structured Data Management Example (SQL Integration)
+
+While most modeling work is done in R, SQL remains essential for summarizing, cleaning, and staging patient-level data from claims and EMRs. Below is a representative query using `sqldf` to analyze the distribution of high-risk patients by sex and income bracket—showcasing how SDOH proxies might inform any of our stratification strategies.
+
+```{r sql-data-summary, echo=TRUE, message=FALSE}
+
+# Create a derived income bracket for reporting
+patient_data$income_bracket <- cut(
+  patient_data$zip_income,
+  breaks = c(-Inf, 40000, 60000, 80000, Inf),
+  labels = c("<40K", "40–60K", "60–80K", "80K+")
+)
+
+# SQL-style summary: high-risk patients by sex and income bracket
+sql_summary <- sqldf("
+  SELECT 
+    sex,
+    income_bracket,
+    COUNT(*) AS total_patients,
+    SUM(high_risk) AS high_risk_patients,
+    ROUND(100.0 * SUM(high_risk) / COUNT(*), 1) AS pct_high_risk
+  FROM patient_data
+  GROUP BY sex, income_bracket
+  ORDER BY income_bracket, sex
+")
+
+sql_summary
+```
+
+```{r echo=FALSE}
+patient_data %>%
+  mutate(high_risk = factor(high_risk, labels = c("Not High Risk", "High Risk"))) %>%
+  select(high_risk, age, zip_income, ed_visits, inpatient_admits, med_adherence_score, 
+         total_cost, hypertension, diabetes, copd, depression, cancer) %>%
+  tbl_summary(by = high_risk,
+              statistic = list(all_continuous() ~ "{mean} ({sd})",
+                               all_categorical() ~ "{n} ({p}%)"),
+              digits = all_continuous() ~ 1,
+              label = list(zip_income ~ "ZIP-Level Income",
+                           ed_visits ~ "ED Visits",
+                           inpatient_admits ~ "Inpatient Admits",
+                           med_adherence_score ~ "Medication Adherence Score",
+                           total_cost ~ "Total Cost")) %>%
+  modify_header(label ~ "**Variable**") %>%
+  bold_labels() %>%
+  add_p() %>%
+  modify_caption("**Table: Patient Characteristics Stratified by Risk Status**")
+```
+
+# Exploratory Data Analysis
+
+To better understand the drivers of risk and opportunity for intervention, we conducted exploratory data analysis on the synthetic population.
+
+```{r summary-stats, echo=FALSE}
+# Basic summary using gtsummary
+patient_data %>%
+  select(age, zip_income, ed_visits, inpatient_admits, primary_care_visits, 
+         med_adherence_score, total_cost, hypertension, diabetes, copd, depression, cancer) %>%
+  tbl_summary(statistic = list(all_continuous() ~ "{mean} ({sd})",
+                               all_categorical() ~ "{n} ({p}%)"),
+              digits = all_continuous() ~ 1,
+              label = list(zip_income ~ "ZIP-Level Income",
+                           ed_visits ~ "ED Visits",
+                           inpatient_admits ~ "Inpatient Admits",
+                           primary_care_visits ~ "Primary Care Visits",
+                           med_adherence_score ~ "Medication Adherence Score",
+                           total_cost ~ "Total Cost",
+                           hypertension ~ "HTN",
+                           copd ~ "COPD")) %>%
+  modify_header(label ~ "**Variable**") %>%
+  bold_labels()
+```
+
+```{r corr-plot, echo=FALSE}
+num_vars <- patient_data %>%
+  select(age, zip_income, ed_visits, inpatient_admits, primary_care_visits,
+         med_adherence_score, total_cost, hypertension, diabetes, copd, depression, cancer)
+
+corr_matrix <- cor(num_vars)
+corrplot(corr_matrix, method = "color", type = "lower", tl.cex = 0.8)
+```
+
+-   This **correlation matrix** suggests that total cost is strongly associated with increased inpatient visits as well as moderately associated with the presence of chronic conditions
+
+```{r plots-risk, echo=FALSE}
+ggplot(patient_data, aes(x = total_cost, fill = as.factor(high_risk))) +
+  geom_histogram(bins = 40, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("#002d72", "#fdb813")) + 
+  labs(title = "Distribution of Total Cost by Risk Group", x = "Total Cost", fill = "High Risk")
+
+ggplot(patient_data, aes(x = inpatient_admits, fill = as.factor(high_risk))) +
+  geom_bar(position = "dodge") + 
+  scale_fill_manual(values = c("#002d72", "#fdb813")) + 
+  labs(title = "Inpatient Admissions by Risk Group", x = "Inpatient Admissions", fill = "High Risk")
+```
+
+-   Visualizations show that a small subset of patients (top 10%) drive a disproportionate share of inpatient admits and total costs
+-   High risk groups appear to experience generally higher cost and inpatient admissions than low risk groups
+
+```{r risk-prof-tab, echo=FALSE}
+# Create the group-level summary
+risk_profile <- patient_data %>%
+  group_by(high_risk) %>%
+  summarise(
+    `Mean Age` = round(mean(age), 1),
+    `% Female` = round(mean(sex == "Female") * 100, 1),
+    `Avg Inpatient Admits` = round(mean(inpatient_admits), 2),
+    `Avg ED Visits` = round(mean(ed_visits), 2),
+    `Avg Total Cost ($)` = round(mean(total_cost), 0),
+    `Avg # Chronic Conditions` = round(rowMeans(select(., hypertension, diabetes, copd, depression, cancer)) %>% mean() * 5, 2)
+  ) %>%
+  mutate(Risk_Group = ifelse(high_risk == 1, "High Risk", "Not High Risk")) %>%
+  select(Risk_Group, everything(), -high_risk)
+
+# Render it nicely
+risk_profile %>%
+  gt() %>%
+  tab_header(
+    title = "High Risk vs Not High Risk: Key Characteristics"
+  ) %>%
+  cols_label(
+    `Mean Age` = "Mean Age",
+    `% Female` = "% Female",
+    `Avg Inpatient Admits` = "Avg Inpatient Admits",
+    `Avg ED Visits` = "Avg ED Visits",
+    `Avg Total Cost ($)` = "Avg Total Cost ($)",
+    `Avg # Chronic Conditions` = "Avg Chronic Conditions"
+  ) %>%
+  fmt_number(columns = everything(), decimals = 1) %>%
+  cols_align(align = "center", columns = everything())
+```
+
+-   High-risk patients are more likely to be older, with higher ED costs, and higher inpatient utilization.
+
+These findings support the need for a tiered risk segmentation strategy to prioritize care management resources effectively.
+
+# Risk Score Modeling
+
+```{r model-setup, message=FALSE}
+
+# Clean modeling dataset
+model_data <- patient_data %>%
+  mutate(
+    high_risk = factor(high_risk, labels = c("No", "Yes")),
+    sex = factor(sex),
+    income_bracket = cut(zip_income, breaks = c(-Inf, 40000, 60000, 80000, Inf),
+                         labels = c("<40K", "40–60K", "60–80K", "80K+"))
+  ) %>%
+  select(high_risk, age, sex, income_bracket, hypertension, diabetes, copd,
+         depression, cancer, ed_visits, inpatient_admits, med_adherence_score)
+
+# Train/test split
+set.seed(42)
+train_index <- createDataPartition(model_data$high_risk, p = 0.75, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+```
+
+```{r log-mod1}
+logit_mod1 <-
+  glm(high_risk ~., data = train_data, family = binomial)
+
+library(broom)
+
+glm_results <- tidy(logit_mod1) %>%
+  mutate(
+    estimate = round(estimate, 3),
+    std.error = round(std.error, 3),
+    p.value = round(p.value, 3),
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      p.value < 0.1 ~ ".",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(term, estimate, std.error, p.value, significance)
+
+glm_results %>%
+  gt() %>%
+  tab_header(title = "Logistic Regression Coefficients: High-Risk Prediction") %>%
+  cols_label(
+    term = "Predictor",
+    estimate = "Estimate",
+    std.error = "Std. Error",
+    p.value = "P-Value",
+    significance = " "
+  ) %>%
+  tab_source_note("Note: *** p < 0.001, ** p < 0.01, * p < 0.05")
+```
+
+```{r mod-performance, message=FALSE}
+# Predict probabilities on test set
+pred_probs <- predict(logit_mod1, newdata = test_data, type = "response")
+pred_class <- ifelse(pred_probs > 0.8, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+
+# Confusion matrix
+# Fit confusion matrix as usual
+cm <- confusionMatrix(pred_class, test_data$high_risk, positive = "Yes")
+
+# Extract the actual confusion matrix counts
+cm_matrix <- as.table(cm$table)
+cm_df <- as.data.frame(cm_matrix)
+
+# Optional: Rename for readability
+names(cm_df) <- c("Actual", "Predicted", "Count")
+
+# Create clean gt table
+cm_df %>%
+  tidyr::pivot_wider(names_from = Predicted, values_from = Count) %>%
+  gt() %>%
+  tab_header(title = "Confusion Matrix: Model Predictions vs Actual") %>%
+  cols_label(Actual = "Actual Class", No = "Predicted: No", Yes = "Predicted: Yes") %>%
+  cols_align("center", everything())
+
+# ROC Curve
+roc_obj <- roc(test_data$high_risk, pred_probs)
+
+roc_data <- data.frame(
+  tpr = roc_obj$sensitivities,
+  fpr = 1 - roc_obj$specificities
+)
+
+ggplot(roc_data, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#002d72", size = 1.2) +
+  geom_abline(linetype = "dashed", color = "#fdb813") +
+  labs(
+    title = "ROC Curve: Predicting High-Risk Patients",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 12) +
+  coord_fixed()
+```
+
+```{r pred-risk-dist}
+test_data$predicted_risk <- pred_probs
+
+ggplot(test_data, aes(x = predicted_risk, fill = high_risk)) +
+  geom_histogram(bins = 40, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("#002d72", "#fdb813")) +
+  labs(title = "Predicted Risk Distribution", x = "Predicted Probability of High Risk", fill = "Actual")
+
+```
+
+A logistic regression model was trained to predict high-risk patients based on demographics, chronic conditions, and recent utilization patterns.
+
+-   The model achieved an AUC of `r round(auc(roc_obj), 3)`, indicating modest discriminative ability—sufficient for exploratory stratification, ***though not deployment-ready without further tuning***.
+-   Features with strongest predictive value included inpatient admits, diabetes, and COPD.
+-   The confusion matrix shows balance between sensitivity and specificity at a 0.8 threshold.
+-   The predicted risk distribution highlights some moderate separation between high- and low-risk patients, enabling future segmentation.
+-   ***Note***: The model predicted all patients as high-risk at the default threshold. This is a common challenge in imbalanced classification and would be addressed through threshold optimization and calibration in a production setting.
+
+This model offers a prototype framework that could inform tiered outreach strategies under value-based care, pending validation with real patient data.
+
+# Cost Savings & ROI Estimation
+
+```{r}
+# Target top 10% predicted risk
+cutoff <- quantile(test_data$predicted_risk, 0.9)
+target_group <- test_data %>%
+  filter(predicted_risk >= cutoff)
+
+# Assumptions
+avg_savings_pct <- 0.12        # 12% cost savings per targeted patient
+intervention_cost <- 400       # per patient per year
+
+# Baseline cost of targeted group
+baseline_total_cost <- mean(patient_data$total_cost)  # population-wide
+target_cost <- sum(target_group$predicted_risk * baseline_total_cost)
+
+# Estimated savings + cost
+estimated_savings <- target_cost * avg_savings_pct
+total_program_cost <- nrow(target_group) * intervention_cost
+estimated_roi <- (estimated_savings - total_program_cost) / total_program_cost
+
+# Summary output
+roi_summary <- data.frame(
+  `Patients Targeted` = nrow(target_group),
+  `Avg Cost (Est)` = round(target_cost / nrow(target_group), 0),
+  `Est. Savings per Patient` = round(avg_savings_pct * target_cost / nrow(target_group), 0),
+  `Total Estimated Savings` = round(estimated_savings, 0),
+  `Total Program Cost` = round(total_program_cost, 0),
+  `ROI (12-Month)` = paste0(round(estimated_roi * 100, 1), "%")
+)
+
+roi_summary %>%
+  gt() %>%
+  tab_header(title = "Estimated ROI: Targeted Care Management Program") %>%
+  cols_label(
+    Patients.Targeted = "Patients Targeted",
+    Avg.Cost..Est. = "Avg Cost (Est.)",
+    Est..Savings.per.Patient = "Est. Savings/Patient",
+    Total.Estimated.Savings = "Total Estimated Savings",
+    Total.Program.Cost = "Program Cost",
+    ROI..12.Month. = "ROI (12-Month)"
+  ) %>%
+  fmt_currency(columns = c(2:5), decimals = 0) %>%
+  cols_align("center", everything())
+```
+
+To quantify business value, we modeled a care management program targeting the top 10% of predicted high-risk patients.
+
+-   **Patients Targeted:** `r nrow(target_group)`
+-   **Estimated 12-Month Cost Savings:** `r scales::dollar(round(estimated_savings, 0))`
+-   **Program Cost:** `r scales::dollar(round(total_program_cost, 0))`
+-   **Projected ROI:** `r round(estimated_roi * 100, 1)`%
+
+Assuming an average savings of +6.7% in total cost of care, we see some signal in our methods of risk-tiering, consistent with benchmarks for high-impact care coordination efforts.
+
+```{r}
+# Sample 5 patients from top 10% predicted risk
+sample_patients <- target_group %>%
+  select(age, sex, ed_visits, inpatient_admits, 
+         med_adherence_score, predicted_risk) %>%
+  arrange(desc(predicted_risk)) %>%
+  head(5) %>%
+  mutate(
+    predicted_risk = round(predicted_risk, 2),
+    med_adherence_score = round(med_adherence_score, 2)
+  )
+
+# Format for presentation
+sample_patients %>%
+  gt() %>%
+  tab_header(title = "Patients Flagged for High-Risk Outreach") %>%
+  cols_label(
+    age = "Age",
+    sex = "Sex",
+    ed_visits = "ED Visits",
+    inpatient_admits = "Inpatient Admits",
+    med_adherence_score = "Med Adherence Score",
+    predicted_risk = "Predicted Risk Score"
+  ) %>%
+  cols_align("center", everything())
+```
+
+The table below shows a sample of five patients identified in the top 10% of predicted risk. These individuals share patterns of elevated utilization (e.g., repeat admissions), low-to-moderate medication adherence, and higher overall risk scores.
+
+Targeted care management—such as intensive case reviews or social work referrals—could help reduce unnecessary admissions and improve adherence, supporting both cost containment and clinical outcomes.
+
+This micro-level lens highlights how predictive modeling informs actionable, patient-level decisions under value-based care.
+
+# Strategic Implications
+
+This analysis demonstrates how predictive analytics can enable targeted care management and improve performance under value-based care agreements. By identifying high-risk patients in advance, our team might be able to:
+
+-   Reduce preventable admissions and emergency department visits
+-   Allocate care coordination resources more efficiently
+-   Quantify and track impact on total cost of care
+-   Align operational priorities with population health goals
+
+The risk model provides a scalable foundation for tiered interventions, prospective outreach, and continuous ROI measurement—all aligned with the analytics and leadership responsibilities of the AVP role.
+
+# Conclusion
+
+This project highlights a practical and scalable approach to value-based performance optimization. [**If I were serving this team with access to real patient data, this framework could be piloted and adapted to Ochsner’s specific contracts, care models, and operational realities.**]{.underline}
+
+I look forward to your consideration and talking soon.
